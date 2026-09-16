@@ -6,6 +6,10 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- ✨(frontend) duplicate with subdocuments #2584
+
 ## [v5.7.0] - 2026-09-15
 
 ### Added
