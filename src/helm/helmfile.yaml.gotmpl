@@ -43,12 +43,16 @@ releases:
     chart: ./extra/valkey
     needs:
       - valkey-operator
+    values:
+      - env.d/{{ .Environment.Name }}/values.valkey.yaml.gotmpl
 
   - name: valkey-yhub
     namespace: {{ .Namespace }}
     chart: ./extra/valkey
     needs:
       - valkey-operator
+    values:
+      - env.d/{{ .Environment.Name }}/values.valkey.yaml.gotmpl
 
   - name: impress
     version: {{ .Values.version }}

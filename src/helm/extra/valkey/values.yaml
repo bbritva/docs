@@ -15,6 +15,8 @@ resources:
   limits:
     memory: 256Mi
 
+# The volume of each Valkey pod, passed to the operator as is: capacity,
+# storageClassName (the cluster default when unset), retainAfterDeleted.
 # Without storage the data lives in an emptyDir and is gone with the pod
 storage:
   capacity: 1Gi
