@@ -735,7 +735,7 @@ def test_api_documents_create_for_owner_with_empty_content():
 @override_settings(SERVER_TO_SERVER_API_TOKENS=["DummyToken"])
 def test_api_documents_create_for_owner_with_parent(mock_convert_md):
     """
-    Passing "parent_id" should create the document as a child of that document
+    Passing "parent_document_id" should create the document as a child of that document
     instead of a new root, so both show up in the same sidebar tree.
     """
     user = factories.UserFactory(language="en-us")
@@ -746,7 +746,7 @@ def test_api_documents_create_for_owner_with_parent(mock_convert_md):
         "content": "Document content",
         "sub": str(user.sub),
         "email": user.email,
-        "parent_id": str(parent.id),
+        "parent_document_id": str(parent.id),
     }
 
     with mock.patch("core.api.serializers.posthog_capture") as mock_capture:
@@ -799,7 +799,7 @@ def test_api_documents_create_for_owner_with_parent_admin():
             "content": "Document content",
             "sub": str(user.sub),
             "email": user.email,
-            "parent_id": str(parent.id),
+            "parent_document_id": str(parent.id),
         },
         format="json",
         HTTP_AUTHORIZATION="Bearer DummyToken",
@@ -825,7 +825,7 @@ def test_api_documents_create_for_owner_with_parent_inherited_role():
             "content": "Document content",
             "sub": str(user.sub),
             "email": user.email,
-            "parent_id": str(parent.id),
+            "parent_document_id": str(parent.id),
         },
         format="json",
         HTTP_AUTHORIZATION="Bearer DummyToken",
@@ -849,14 +849,16 @@ def test_api_documents_create_for_owner_with_unknown_parent():
             "content": "Document content",
             "sub": str(user.sub),
             "email": user.email,
-            "parent_id": "5ecb4b2a-4b4c-4b2a-8b4c-4b2a8b4c4b2a",
+            "parent_document_id": "5ecb4b2a-4b4c-4b2a-8b4c-4b2a8b4c4b2a",
         },
         format="json",
         HTTP_AUTHORIZATION="Bearer DummyToken",
     )
 
     assert response.status_code == 400
-    assert response.json() == {"parent_id": ["The parent document does not exist."]}
+    assert response.json() == {
+        "parent_document_id": ["The parent document does not exist."]
+    }
     assert Document.objects.exists() is False
 
 
@@ -876,14 +878,16 @@ def test_api_documents_create_for_owner_with_deleted_parent():
             "content": "Document content",
             "sub": str(user.sub),
             "email": user.email,
-            "parent_id": str(parent.id),
+            "parent_document_id": str(parent.id),
         },
         format="json",
         HTTP_AUTHORIZATION="Bearer DummyToken",
     )
 
     assert response.status_code == 400
-    assert response.json() == {"parent_id": ["The parent document does not exist."]}
+    assert response.json() == {
+        "parent_document_id": ["The parent document does not exist."]
+    }
     assert Document.objects.filter(title="My Document").exists() is False
 
 
@@ -905,7 +909,7 @@ def test_api_documents_create_for_owner_with_parent_insufficient_role(role):
             "content": "Document content",
             "sub": str(user.sub),
             "email": user.email,
-            "parent_id": str(parent.id),
+            "parent_document_id": str(parent.id),
         },
         format="json",
         HTTP_AUTHORIZATION="Bearer DummyToken",
@@ -913,7 +917,9 @@ def test_api_documents_create_for_owner_with_parent_insufficient_role(role):
 
     assert response.status_code == 400
     assert response.json() == {
-        "parent_id": ["You do not have permission to create a child on this document."]
+        "parent_document_id": [
+            "You do not have permission to create a child on this document."
+        ]
     }
     assert Document.objects.filter(title="My Document").exists() is False
 
@@ -932,7 +938,7 @@ def test_api_documents_create_for_owner_with_parent_no_access():
             "content": "Document content",
             "sub": str(user.sub),
             "email": user.email,
-            "parent_id": str(parent.id),
+            "parent_document_id": str(parent.id),
         },
         format="json",
         HTTP_AUTHORIZATION="Bearer DummyToken",
@@ -940,17 +946,57 @@ def test_api_documents_create_for_owner_with_parent_no_access():
 
     assert response.status_code == 400
     assert response.json() == {
-        "parent_id": ["You do not have permission to create a child on this document."]
+        "parent_document_id": [
+            "You do not have permission to create a child on this document."
+        ]
     }
     assert Document.objects.filter(title="My Document").exists() is False
 
 
 @override_settings(SERVER_TO_SERVER_API_TOKENS=["DummyToken"])
 @pytest.mark.usefixtures("mock_convert_md")
-def test_api_documents_create_for_owner_with_parent_and_unknown_user():
+def test_api_documents_create_for_owner_with_parent_and_invited_user():
     """
-    A user who does not exist yet holds no role on the parent, so there is nothing to
-    check against: "parent_id" is refused rather than silently falling back to a root.
+    A user with no account yet holds no role, but an owner invitation on the parent is
+    the same promise in a pending form: the child is created under the parent.
+    """
+    parent = factories.DocumentFactory()
+    factories.InvitationFactory(
+        document=parent, email="john.doe@example.com", role="owner"
+    )
+
+    response = APIClient().post(
+        "/api/v1.0/documents/create-for-owner/",
+        {
+            "title": "My Document",
+            "content": "Document content",
+            "sub": "unknown-sub",
+            "email": "john.doe@example.com",
+            "parent_document_id": str(parent.id),
+        },
+        format="json",
+        HTTP_AUTHORIZATION="Bearer DummyToken",
+    )
+
+    assert response.status_code == 201
+
+    document = Document.objects.get(title="My Document")
+    assert document.get_parent() == parent
+    assert document.accesses.exists() is False
+
+    # Invited, unlike the access-row case: `_convert_valid_invitations` backfills
+    # `creator` only on the documents an invitation points at.
+    assert Invitation.objects.filter(
+        document=document, email="john.doe@example.com", role="owner"
+    ).exists()
+
+
+@override_settings(SERVER_TO_SERVER_API_TOKENS=["DummyToken"])
+@pytest.mark.usefixtures("mock_convert_md")
+def test_api_documents_create_for_owner_with_parent_and_uninvited_user():
+    """
+    Without that invitation there is nothing standing in for a role, so the parent is
+    refused rather than silently falling back to a root.
     """
     parent = factories.DocumentFactory()
 
@@ -961,7 +1007,7 @@ def test_api_documents_create_for_owner_with_parent_and_unknown_user():
             "content": "Document content",
             "sub": "unknown-sub",
             "email": "john.doe@example.com",
-            "parent_id": str(parent.id),
+            "parent_document_id": str(parent.id),
         },
         format="json",
         HTTP_AUTHORIZATION="Bearer DummyToken",
@@ -969,8 +1015,8 @@ def test_api_documents_create_for_owner_with_parent_and_unknown_user():
 
     assert response.status_code == 400
     assert response.json() == {
-        "parent_id": [
-            "Cannot create a child document for a user who does not exist yet."
+        "parent_document_id": [
+            "This email has no owner invitation on the parent document."
         ]
     }
     assert Document.objects.filter(title="My Document").exists() is False
@@ -979,8 +1025,34 @@ def test_api_documents_create_for_owner_with_parent_and_unknown_user():
 
 @override_settings(SERVER_TO_SERVER_API_TOKENS=["DummyToken"])
 @pytest.mark.usefixtures("mock_convert_md")
+def test_api_documents_create_for_owner_with_parent_and_reader_invitation():
+    """A non-owner invitation on the parent is not enough: the promise must be ownership."""
+    parent = factories.DocumentFactory()
+    factories.InvitationFactory(
+        document=parent, email="john.doe@example.com", role="reader"
+    )
+
+    response = APIClient().post(
+        "/api/v1.0/documents/create-for-owner/",
+        {
+            "title": "My Document",
+            "content": "Document content",
+            "sub": "unknown-sub",
+            "email": "john.doe@example.com",
+            "parent_document_id": str(parent.id),
+        },
+        format="json",
+        HTTP_AUTHORIZATION="Bearer DummyToken",
+    )
+
+    assert response.status_code == 400
+    assert Document.objects.filter(title="My Document").exists() is False
+
+
+@override_settings(SERVER_TO_SERVER_API_TOKENS=["DummyToken"])
+@pytest.mark.usefixtures("mock_convert_md")
 def test_api_documents_create_for_owner_without_parent_stays_root():
-    """Backward compatibility: no "parent_id" still creates a root with an access row."""
+    """Backward compatibility: no "parent_document_id" still creates a root with an access row."""
     user = factories.UserFactory()
 
     response = APIClient().post(

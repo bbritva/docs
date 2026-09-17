@@ -441,15 +441,16 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
     if the user will pre-exist in Docs database. If the user pre-exist, we will ignore the
     submitted "email" field and use the email address set on the user account in our database
 
-    An optional "parent_id" makes the new document a child of an existing one instead of a
-    new root. The caller authenticates with a shared server key and names an arbitrary user,
-    so the parent is only accepted when that user is already owner or admin on it.
+    An optional "parent_document_id" makes the new document a child of an existing one
+    instead of a new root. The caller authenticates with a shared server key and names an
+    arbitrary user, so the parent is only accepted when that user is already privileged on
+    it -- owner or admin for a user who exists, an owner invitation for one who does not.
     """
 
     # Document
     title = serializers.CharField(required=True)
     content = serializers.CharField(required=True)
-    parent_id = serializers.UUIDField(required=False)
+    parent_document_id = serializers.UUIDField(required=False)
     # User
     sub = serializers.CharField(
         required=True, validators=[validators.sub_validator], max_length=255
@@ -483,7 +484,9 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
 
         # Resolved (and authorized) before the conversion: a rejected parent must cost
         # neither a call to the converter microservice nor a half-created document.
-        parent = self._resolve_parent(validated_data.get("parent_id"), user)
+        parent = self._resolve_parent(
+            validated_data.get("parent_document_id"), user, email
+        )
 
         try:
             document_content = Converter().convert(
@@ -525,21 +528,26 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
             document=document,
         )
 
-        if parent is not None:
-            # A child inherits the accesses of its ancestors, exactly like a document
-            # created through the "children" route, which creates no access row either.
-            # Adding one here would be a second, redundant source of truth for a role
-            # the user already holds through the parent.
-            pass
-        elif user:
-            # Associate the document with the pre-existing user
-            models.DocumentAccess.objects.create(
-                document=document,
-                role=models.RoleChoices.OWNER,
-                user=user,
-            )
+        if user:
+            if parent is None:
+                # Associate the document with the pre-existing user
+                models.DocumentAccess.objects.create(
+                    document=document,
+                    role=models.RoleChoices.OWNER,
+                    user=user,
+                )
+            # A child gets no access row: it inherits its ancestors' accesses, exactly
+            # like a document created through the "children" route, which creates none
+            # either. A direct row would be a second source of truth for a role the user
+            # already holds through the parent.
         else:
-            # The user doesn't exist in our database: we need to invite him/her
+            # The user doesn't exist in our database: we need to invite him/her.
+            #
+            # A child is invited too, even though the parent's invitation would already
+            # cover it once converted. This is not the access-row case above:
+            # `User._convert_valid_invitations` backfills `creator` only on the documents
+            # an invitation actually points at, so a child with no invitation of its own
+            # would stay creatorless for good.
             models.Invitation.objects.create(
                 document=document,
                 email=email,
@@ -553,44 +561,68 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
             self._send_email_notification(document, validated_data, email, language)
         return document
 
-    def _resolve_parent(self, parent_id, user):
+    def _resolve_parent(self, parent_document_id, user, email):
         """Return the parent document to create the new document under, or None.
 
         This route authenticates with a shared server key and takes an arbitrary
         "sub"/"email", so without a check here any caller holding the key could graft a
-        document onto any document of the instance. The parent is therefore only accepted
-        when the resolved user is already owner or admin on it -- `get_role` walks the
-        ancestors, so a role inherited from higher up counts.
-        """
-        if parent_id is None:
-            return None
+        document onto any document of the instance.
 
-        if user is None:
-            # The invitation branch below has nobody to check a role against: the user
-            # does not exist yet, so they cannot hold any role on the parent.
-            raise serializers.ValidationError(
-                {
-                    "parent_id": [
-                        "Cannot create a child document for a user who does not exist yet."
-                    ]
-                }
-            )
+        The bar is a privileged right on the parent, not merely the right to create
+        children there. Docs' own in-app rule is `children_create`, which is editor and
+        above, and this is deliberately stricter than that, for two reasons:
+
+        - A child gets no access row of its own, so the named user's role on it comes
+          wholly from the ancestors. Under an editor-level parent the new document would
+          have `accesses_manage` false, while `_send_email_notification` below tells that
+          same user "You have been granted ownership of a new document". The claim has to
+          be true.
+        - The invited-user branch just below can only sensibly ask for an owner
+          invitation. Accepting an editor for a user who exists, while demanding an owner
+          invitation for one who does not, would be two different bars for the same act.
+
+        The cost we accept: this diverges from `children_create`, so an editor who could
+        create a child by hand in the UI cannot have one created for them through this
+        route, and upstreaming this will need that conversation.
+        """
+        if parent_document_id is None:
+            return None
 
         try:
             parent = models.Document.objects.get(
-                pk=parent_id,
+                pk=parent_document_id,
                 ancestors_deleted_at__isnull=True,
                 deleted_at__isnull=True,
             )
         except models.Document.DoesNotExist as err:
             raise serializers.ValidationError(
-                {"parent_id": ["The parent document does not exist."]}
+                {"parent_document_id": ["The parent document does not exist."]}
             ) from err
 
+        if user is None:
+            # No account yet, so there is no role to read -- and `get_role` /
+            # `get_abilities` must never be called with None. What stands in for a role
+            # is the invitation that already promises this email ownership of the parent:
+            # the right exists, it is just still pending.
+            if not models.Invitation.objects.filter(
+                document=parent,
+                email=email,
+                role=models.RoleChoices.OWNER,
+            ).exists():
+                raise serializers.ValidationError(
+                    {
+                        "parent_document_id": [
+                            "This email has no owner invitation on the parent document."
+                        ]
+                    }
+                )
+            return parent
+
+        # `get_role` walks the ancestors, so a role inherited from higher up counts.
         if parent.get_role(user) not in choices.PRIVILEGED_ROLES:
             raise serializers.ValidationError(
                 {
-                    "parent_id": [
+                    "parent_document_id": [
                         "You do not have permission to create a child on this document."
                     ]
                 }
