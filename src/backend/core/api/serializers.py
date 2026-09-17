@@ -440,11 +440,16 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
     Both "sub" and "email" are required because the external app calling doesn't know
     if the user will pre-exist in Docs database. If the user pre-exist, we will ignore the
     submitted "email" field and use the email address set on the user account in our database
+
+    An optional "parent_id" makes the new document a child of an existing one instead of a
+    new root. The caller authenticates with a shared server key and names an arbitrary user,
+    so the parent is only accepted when that user is already owner or admin on it.
     """
 
     # Document
     title = serializers.CharField(required=True)
     content = serializers.CharField(required=True)
+    parent_id = serializers.UUIDField(required=False)
     # User
     sub = serializers.CharField(
         required=True, validators=[validators.sub_validator], max_length=255
@@ -476,6 +481,10 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
             email = user.email
             language = user.language or language
 
+        # Resolved (and authorized) before the conversion: a rejected parent must cost
+        # neither a call to the converter microservice nor a half-created document.
+        parent = self._resolve_parent(validated_data.get("parent_id"), user)
+
         try:
             document_content = Converter().convert(
                 validated_data["content"], mime_types.MARKDOWN, mime_types.YJS
@@ -485,14 +494,27 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
                 {"content": ["Could not convert content"]}
             ) from err
 
-        document = create_tree_node_with_retry(
-            lambda: models.Document.add_root(
-                title=validated_data["title"],
-                creator=user,
+        if parent is None:
+            document = create_tree_node_with_retry(
+                lambda: models.Document.add_root(
+                    title=validated_data["title"],
+                    creator=user,
+                )
             )
-        )
+        else:
+            document = create_tree_node_with_retry(
+                lambda: parent.add_child(
+                    title=validated_data["title"],
+                    creator=user,
+                )
+            )
 
-        posthog_capture(PosthogEventName.DOC_CREATED, user, {}, document=document)
+        posthog_capture(
+            PosthogEventName.DOC_CREATED,
+            user,
+            {} if parent is None else {"document_parent": str(parent.id)},
+            document=document,
+        )
         posthog_capture(
             PosthogEventName.DOC_IMPORTED,
             user,
@@ -503,7 +525,13 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
             document=document,
         )
 
-        if user:
+        if parent is not None:
+            # A child inherits the accesses of its ancestors, exactly like a document
+            # created through the "children" route, which creates no access row either.
+            # Adding one here would be a second, redundant source of truth for a role
+            # the user already holds through the parent.
+            pass
+        elif user:
             # Associate the document with the pre-existing user
             models.DocumentAccess.objects.create(
                 document=document,
@@ -524,6 +552,51 @@ class ServerCreateDocumentSerializer(serializers.Serializer):
         if validated_data.get("send_notification_email", True):
             self._send_email_notification(document, validated_data, email, language)
         return document
+
+    def _resolve_parent(self, parent_id, user):
+        """Return the parent document to create the new document under, or None.
+
+        This route authenticates with a shared server key and takes an arbitrary
+        "sub"/"email", so without a check here any caller holding the key could graft a
+        document onto any document of the instance. The parent is therefore only accepted
+        when the resolved user is already owner or admin on it -- `get_role` walks the
+        ancestors, so a role inherited from higher up counts.
+        """
+        if parent_id is None:
+            return None
+
+        if user is None:
+            # The invitation branch below has nobody to check a role against: the user
+            # does not exist yet, so they cannot hold any role on the parent.
+            raise serializers.ValidationError(
+                {
+                    "parent_id": [
+                        "Cannot create a child document for a user who does not exist yet."
+                    ]
+                }
+            )
+
+        try:
+            parent = models.Document.objects.get(
+                pk=parent_id,
+                ancestors_deleted_at__isnull=True,
+                deleted_at__isnull=True,
+            )
+        except models.Document.DoesNotExist as err:
+            raise serializers.ValidationError(
+                {"parent_id": ["The parent document does not exist."]}
+            ) from err
+
+        if parent.get_role(user) not in choices.PRIVILEGED_ROLES:
+            raise serializers.ValidationError(
+                {
+                    "parent_id": [
+                        "You do not have permission to create a child on this document."
+                    ]
+                }
+            )
+
+        return parent
 
     def _send_email_notification(self, document, validated_data, email, language):
         """Notify the user about the newly created document."""
